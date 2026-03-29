@@ -7,14 +7,20 @@ import subprocess
 import unicodedata
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
+
+from docx import Document
+from openpyxl import load_workbook
+from pypdf import PdfReader
+from pptx import Presentation
 
 
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:1.5b"
 DEFAULT_MIN_CONFIDENCE = 85
 DEFAULT_MAX_TEXT_CHARS = 6000
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v6"
 CACHE_FILE = Path(__file__).with_name(".path_ai_cache.json")
 
 
@@ -228,6 +234,19 @@ AI_REVIEWABLE_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".txt", ".py", ".m", ".html", ".csv",
 }
 
+SKIP_DIRECTORY_SUFFIXES = {
+    ".app",
+    ".photoslibrary",
+}
+
+SKIP_DIRECTORY_NAMES = {
+    "__pycache__",
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+}
+
 ALWAYS_UNSORTED_KEYWORDS = [
     "ticket",
     "tickets",
@@ -339,6 +358,52 @@ def safe_move(file_path: Path, destination_folder: Path, dry_run: bool = False) 
         counter += 1
 
 
+def list_directory_hints(dir_path: Path, max_items: int = 15) -> str:
+    try:
+        children = sorted(dir_path.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        return ""
+
+    names = []
+    for child in children[:max_items]:
+        names.append(child.name)
+    return " | ".join(names)
+
+
+def collect_directory_preview(dir_path: Path, max_chars: int, max_files: int = 6) -> str:
+    parts = [f"[DIR] {dir_path.name}"]
+    listing = list_directory_hints(dir_path, max_items=20)
+    if listing:
+        parts.append(f"[FILES] {listing}")
+
+    added = 0
+    try:
+        children = sorted(dir_path.rglob("*"), key=lambda path: str(path).lower())
+    except OSError:
+        return "\n".join(parts)[:max_chars]
+
+    for child in children:
+        if added >= max_files:
+            break
+        if not child.is_file():
+            continue
+        if child.name.startswith("."):
+            continue
+        preview = extract_text_preview(child, max(800, max_chars // 3))
+        if not preview:
+            continue
+        parts.append(f"[FILE] {child.name}\n{preview}")
+        added += 1
+        if len("\n".join(parts)) >= max_chars:
+            break
+
+    return "\n".join(parts)[:max_chars]
+
+
+def should_skip_directory(dir_path: Path) -> bool:
+    return dir_path.name in SKIP_DIRECTORY_NAMES or dir_path.suffix.lower() in SKIP_DIRECTORY_SUFFIXES
+
+
 def destination_for_subject(subject: str | None) -> Path | None:
     if not subject:
         return None
@@ -352,11 +417,11 @@ def display_destination(path: Path) -> str:
         return path.name
 
 
-def classify_with_rules(filename: str) -> str | None:
-    if should_force_unsorted(filename):
+def classify_with_rules(name_or_hint: str) -> str | None:
+    if should_force_unsorted(name_or_hint):
         return None
 
-    name = normalize(filename)
+    name = normalize(name_or_hint)
 
     for subject, keywords in SUBJECT_RULES.items():
         for keyword in keywords:
@@ -380,9 +445,10 @@ def save_cache(cache: dict) -> None:
     CACHE_FILE.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def build_cache_key(file_path: Path, model: str) -> str:
+def build_cache_key(file_path: Path, model: str, aggressive: bool = False) -> str:
     stat = file_path.stat()
-    return f"{CACHE_VERSION}:{file_path}:{stat.st_size}:{stat.st_mtime_ns}:{model}"
+    mode = "aggressive" if aggressive else "normal"
+    return f"{CACHE_VERSION}:{mode}:{file_path}:{stat.st_size}:{stat.st_mtime_ns}:{model}"
 
 
 def extract_response_text(response_data: dict) -> str:
@@ -395,6 +461,113 @@ def read_text_file(file_path: Path, max_chars: int) -> str:
         return file_path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
     except OSError:
         return ""
+
+
+def read_pdf(file_path: Path, max_chars: int) -> str:
+    try:
+        reader = PdfReader(str(file_path))
+    except Exception:
+        return ""
+
+    parts = []
+    total = 0
+    for page in reader.pages[:8]:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if not text:
+            continue
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        chunk = text[:remaining]
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n".join(parts).strip()
+
+
+def read_docx(file_path: Path, max_chars: int) -> str:
+    try:
+        document = Document(str(file_path))
+    except Exception:
+        return ""
+
+    parts = []
+    total = 0
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        chunk = text[:remaining]
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n".join(parts).strip()
+
+
+def read_pptx(file_path: Path, max_chars: int) -> str:
+    try:
+        presentation = Presentation(str(file_path))
+    except Exception:
+        return ""
+
+    parts = []
+    total = 0
+    for slide in presentation.slides[:10]:
+        for shape in slide.shapes:
+            text = getattr(shape, "text", "").strip()
+            if not text:
+                continue
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            chunk = text[:remaining]
+            parts.append(chunk)
+            total += len(chunk)
+        if total >= max_chars:
+            break
+    return "\n".join(parts).strip()
+
+
+def read_xlsx(file_path: Path, max_chars: int) -> str:
+    try:
+        workbook = load_workbook(str(file_path), read_only=True, data_only=True)
+    except Exception:
+        return ""
+
+    parts = []
+    total = 0
+    for sheet in workbook.worksheets[:4]:
+        line = f"[Sheet] {sheet.title}"
+        parts.append(line)
+        total += len(line)
+        for row in sheet.iter_rows(min_row=1, max_row=20, values_only=True):
+            cells = [str(value).strip() for value in row if value not in (None, "")]
+            if not cells:
+                continue
+            line = " | ".join(cells)
+            remaining = max_chars - total
+            if remaining <= 0:
+                workbook.close()
+                return "\n".join(parts).strip()
+            chunk = line[:remaining]
+            parts.append(chunk)
+            total += len(chunk)
+    workbook.close()
+    return "\n".join(parts).strip()
+
+
+def read_zip_listing(file_path: Path, max_chars: int) -> str:
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            names = archive.namelist()[:40]
+    except Exception:
+        return ""
+
+    return "\n".join(names)[:max_chars]
 
 
 def read_via_textutil(file_path: Path, max_chars: int) -> str:
@@ -422,18 +595,39 @@ def extract_text_preview(file_path: Path, max_chars: int) -> str:
     if suffix in {".txt", ".py", ".m", ".html", ".csv"}:
         return read_text_file(file_path, max_chars)
 
-    if suffix in {".docx", ".doc", ".rtf", ".odt", ".pages"}:
+    if suffix == ".pdf":
+        return read_pdf(file_path, max_chars)
+
+    if suffix == ".docx":
+        return read_docx(file_path, max_chars)
+
+    if suffix in {".doc", ".rtf", ".odt", ".pages"}:
         return read_via_textutil(file_path, max_chars)
+
+    if suffix == ".pptx":
+        return read_pptx(file_path, max_chars)
+
+    if suffix in {".xlsx", ".xls"}:
+        return read_xlsx(file_path, max_chars)
+
+    if suffix == ".zip":
+        return read_zip_listing(file_path, max_chars)
 
     return ""
 
 
-def should_use_ai(file_path: Path, preview: str) -> bool:
-    if file_path.suffix.lower() not in AI_REVIEWABLE_EXTENSIONS:
+def should_use_ai(file_path: Path, preview: str, aggressive: bool = False) -> bool:
+    if aggressive:
+        if file_path.suffix.lower() not in VALID_EXTENSIONS:
+            return False
+    elif file_path.suffix.lower() not in AI_REVIEWABLE_EXTENSIONS:
         return False
 
     if should_force_unsorted(file_path.name):
         return False
+
+    if aggressive:
+        return True
 
     if has_academic_hint(file_path.name):
         return True
@@ -444,16 +638,49 @@ def should_use_ai(file_path: Path, preview: str) -> bool:
     return False
 
 
+def should_use_ai_for_text(
+    name_or_hint: str,
+    preview: str,
+    is_dir: bool = False,
+    aggressive: bool = False,
+) -> bool:
+    normalized_name = normalize(name_or_hint)
+
+    if should_force_unsorted(normalized_name):
+        return False
+
+    if aggressive:
+        return True
+
+    if is_dir:
+        if has_academic_hint(normalized_name):
+            return True
+        if preview and has_academic_hint(preview):
+            return True
+        return False
+
+    if has_academic_hint(normalized_name):
+        return True
+
+    if preview and has_academic_hint(preview):
+        return True
+
+    return False
+
+
 def build_ollama_payload(
-    file_path: Path,
+    item_name: str,
+    item_kind: str,
+    item_suffix: str,
     preview: str,
     subjects: list[str],
     model: str,
+    aggressive: bool = False,
 ) -> dict:
     prompt = (
-        "Classifica este ficheiro de Downloads.\n"
-        f"Nome do ficheiro: {file_path.name}\n"
-        f"Extensao: {file_path.suffix.lower()}\n"
+        f"Classifica este {item_kind} de Downloads.\n"
+        f"Nome: {item_name}\n"
+        f"Extensao: {item_suffix}\n"
         "Pastas permitidas: "
         + ", ".join(subjects)
         + "\n"
@@ -461,8 +688,14 @@ def build_ollama_payload(
         "Nao inventes pastas novas.\n"
         "So classifiques numa cadeira se houver evidencia explicita no nome ou no texto.\n"
         "Palavras genericas como exemplo, ficheiro, printable, pdf, tickets ou declaracao nao chegam.\n"
+        "Instaladores, curriculos, bilhetes, capturas de ecra e ficheiros pessoais devem ficar em Por_Organizar.\n"
         "Devolve apenas JSON com: subject, confidence, reason.\n"
     )
+    if aggressive:
+        prompt += (
+            "Modo agressivo: tenta classificar mesmo com pistas fracas, mas nunca atribuas uma cadeira se as pistas "
+            "forem genericas, pessoais ou de software sem contexto academico.\n"
+        )
     if preview:
         prompt += f"Excerto do conteudo:\n{preview}\n"
 
@@ -506,18 +739,27 @@ def classify_with_ai(
     max_text_chars: int,
     cache: dict,
     ollama_url: str,
+    aggressive: bool = False,
 ) -> tuple[str | None, int, str]:
     subjects = list(SUBJECT_DESTINATIONS.keys()) + ["Por_Organizar"]
-    cache_key = build_cache_key(file_path, model)
+    cache_key = build_cache_key(file_path, model, aggressive=aggressive)
     cached = cache.get(cache_key)
     if cached:
         return cached["subject"], cached["confidence"], cached["reason"]
 
     preview = extract_text_preview(file_path, max_text_chars)
-    if not should_use_ai(file_path, preview):
+    if not should_use_ai(file_path, preview, aggressive=aggressive):
         return None, 0, "sem pistas suficientes para classificacao segura"
 
-    payload = build_ollama_payload(file_path, preview, subjects, model)
+    payload = build_ollama_payload(
+        file_path.name,
+        "ficheiro",
+        file_path.suffix.lower(),
+        preview,
+        subjects,
+        model,
+        aggressive=aggressive,
+    )
     request = urllib.request.Request(
         ollama_url,
         data=json.dumps(payload).encode("utf-8"),
@@ -566,9 +808,84 @@ def classify_with_ai(
     return subject, confidence, reason
 
 
+def classify_directory_with_ai(
+    dir_path: Path,
+    model: str,
+    min_confidence: int,
+    max_text_chars: int,
+    cache: dict,
+    ollama_url: str,
+    aggressive: bool = False,
+) -> tuple[str | None, int, str]:
+    subjects = list(SUBJECT_DESTINATIONS.keys()) + ["Por_Organizar"]
+    cache_key = build_cache_key(dir_path, model, aggressive=aggressive)
+    cached = cache.get(cache_key)
+    if cached:
+        return cached["subject"], cached["confidence"], cached["reason"]
+
+    preview = collect_directory_preview(dir_path, max_text_chars)
+    descriptor = f"{dir_path.name} {preview}".strip()
+    if not should_use_ai_for_text(descriptor, preview, is_dir=True, aggressive=aggressive):
+        return None, 0, "sem pistas suficientes para classificacao segura"
+
+    payload = build_ollama_payload(
+        dir_path.name,
+        "pasta",
+        "(sem extensao)",
+        preview,
+        subjects,
+        model,
+        aggressive=aggressive,
+    )
+    request = urllib.request.Request(
+        ollama_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Erro HTTP do Ollama ({exc.code}): {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Erro ao contactar o Ollama. Verifique se a app/servidor Ollama está aberto."
+        ) from exc
+
+    raw_text = extract_response_text(response_data)
+    if not raw_text:
+        raise RuntimeError(f"Resposta do Ollama sem texto útil para {dir_path.name}.")
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"JSON inválido devolvido pelo Ollama para {dir_path.name}: {raw_text}") from exc
+
+    subject = parsed.get("subject", "Por_Organizar")
+    confidence = int(parsed.get("confidence", 0))
+    reason = str(parsed.get("reason", "")).strip()
+
+    if subject not in subjects or confidence < min_confidence:
+        subject = "Por_Organizar"
+
+    cache[cache_key] = {
+        "subject": subject,
+        "confidence": confidence,
+        "reason": reason,
+    }
+    save_cache(cache)
+    return subject, confidence, reason
+
+
 def organize_downloads(
     dry_run: bool = False,
     use_ai: bool = False,
+    ai_aggressive: bool = False,
+    move_unsorted: bool = False,
+    process_directories: bool = True,
     model: str = DEFAULT_MODEL,
     min_confidence: int = DEFAULT_MIN_CONFIDENCE,
     max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
@@ -583,6 +900,7 @@ def organize_downloads(
     cache = load_cache() if use_ai else {}
     moved_count = 0
     unsorted_count = 0
+    kept_count = 0
     ai_count = 0
     processed = 0
 
@@ -590,30 +908,57 @@ def organize_downloads(
         if limit is not None and processed >= limit:
             break
 
-        if not item.is_file() or item.name.startswith("."):
-            continue
-
-        if item.suffix.lower() not in VALID_EXTENSIONS:
+        if item.name.startswith("."):
             continue
 
         processed += 1
-        subject = classify_with_rules(item.name)
+        subject = None
         source = "rules"
         confidence = 100
 
-        if subject is None and use_ai:
-            subject, confidence, _reason = classify_with_ai(
-                item,
-                model=model,
-                min_confidence=min_confidence,
-                max_text_chars=max_text_chars,
-                cache=cache,
-                ollama_url=ollama_url,
-            )
-            source = "ai"
-            ai_count += 1
-            if subject == "Por_Organizar":
-                subject = None
+        if item.is_file():
+            if item.suffix.lower() not in VALID_EXTENSIONS:
+                processed -= 1
+                continue
+
+            subject = classify_with_rules(item.name)
+            if subject is None and use_ai:
+                subject, confidence, _reason = classify_with_ai(
+                    item,
+                    model=model,
+                    min_confidence=min_confidence,
+                    max_text_chars=max_text_chars,
+                    cache=cache,
+                    ollama_url=ollama_url,
+                    aggressive=ai_aggressive,
+                )
+                source = "ai"
+                ai_count += 1
+                if subject == "Por_Organizar":
+                    subject = None
+        elif item.is_dir() and process_directories:
+            if should_skip_directory(item):
+                continue
+
+            hint_text = f"{item.name} {list_directory_hints(item)}".strip()
+            subject = classify_with_rules(hint_text)
+            if subject is None and use_ai:
+                subject, confidence, _reason = classify_directory_with_ai(
+                    item,
+                    model=model,
+                    min_confidence=min_confidence,
+                    max_text_chars=max_text_chars,
+                    cache=cache,
+                    ollama_url=ollama_url,
+                    aggressive=ai_aggressive,
+                )
+                source = "ai"
+                ai_count += 1
+                if subject == "Por_Organizar":
+                    subject = None
+        else:
+            processed -= 1
+            continue
 
         destination = destination_for_subject(subject)
 
@@ -625,23 +970,34 @@ def organize_downloads(
                 print(f"[OK] {item.name} -> {display_destination(final_path.parent)}")
             moved_count += 1
         else:
-            final_path = safe_move(item, UNSORTED_FOLDER, dry_run=dry_run)
-            if source == "ai":
-                print(f"[AI:?{confidence:02d}] {item.name} -> {display_destination(final_path.parent)}")
+            if move_unsorted:
+                final_path = safe_move(item, UNSORTED_FOLDER, dry_run=dry_run)
+                if source == "ai":
+                    print(f"[AI:?{confidence:02d}] {item.name} -> {display_destination(final_path.parent)}")
+                else:
+                    print(f"[?] {item.name} -> {display_destination(final_path.parent)}")
+                unsorted_count += 1
             else:
-                print(f"[?] {item.name} -> {display_destination(final_path.parent)}")
-            unsorted_count += 1
+                if source == "ai":
+                    print(f"[KEEP:{confidence:02d}] {item.name} -> Downloads")
+                else:
+                    print(f"[KEEP] {item.name} -> Downloads")
+                kept_count += 1
 
     print(f"\nPasta organizada: {BASE_FOLDER}")
     print(f"Destino: {DEST_ROOT}")
     print(f"Modo simulacao: {'sim' if dry_run else 'nao'}")
     print(f"Modo IA: {'sim' if use_ai else 'nao'}")
+    print(f"Modo IA agressivo: {'sim' if ai_aggressive else 'nao'}")
+    print(f"Processar pastas: {'sim' if process_directories else 'nao'}")
+    print(f"Mover nao classificados: {'sim' if move_unsorted else 'nao'}")
     if use_ai:
         print(f"Modelo: {model}")
         print(f"Chamadas IA: {ai_count}")
         print(f"Cache: {CACHE_FILE}")
     print(f"Movidos para cadeiras: {moved_count}")
-    print(f"Sem correspondência: {unsorted_count}")
+    print(f"Movidos para Por_Organizar: {unsorted_count}")
+    print(f"Deixados em Downloads: {kept_count}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -657,6 +1013,21 @@ def parse_args() -> argparse.Namespace:
         "--use-ai",
         action="store_true",
         help="Usa o Ollama local para classificar ficheiros nao reconhecidos pelas regras.",
+    )
+    parser.add_argument(
+        "--ai-aggressive",
+        action="store_true",
+        help="Usa IA em quase todos os ficheiros e pastas validos, mesmo com pistas fracas.",
+    )
+    parser.add_argument(
+        "--move-unsorted",
+        action="store_true",
+        help="Move itens nao classificados para Por_Organizar. Por omissao ficam em Downloads.",
+    )
+    parser.add_argument(
+        "--no-directories",
+        action="store_true",
+        help="Nao processa pastas, apenas ficheiros.",
     )
     parser.add_argument(
         "--model",
@@ -693,7 +1064,10 @@ if __name__ == "__main__":
     args = parse_args()
     organize_downloads(
         dry_run=args.dry_run,
-        use_ai=args.use_ai,
+        use_ai=args.use_ai or args.ai_aggressive,
+        ai_aggressive=args.ai_aggressive,
+        move_unsorted=args.move_unsorted,
+        process_directories=not args.no_directories,
         model=args.model,
         min_confidence=args.min_confidence,
         max_text_chars=args.max_text_chars,
