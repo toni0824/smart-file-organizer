@@ -10,10 +10,25 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from docx import Document
-from openpyxl import load_workbook
-from pypdf import PdfReader
-from pptx import Presentation
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
 
 
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
@@ -464,6 +479,9 @@ def read_text_file(file_path: Path, max_chars: int) -> str:
 
 
 def read_pdf(file_path: Path, max_chars: int) -> str:
+    if PdfReader is None:
+        return ""
+
     try:
         reader = PdfReader(str(file_path))
     except Exception:
@@ -488,6 +506,9 @@ def read_pdf(file_path: Path, max_chars: int) -> str:
 
 
 def read_docx(file_path: Path, max_chars: int) -> str:
+    if Document is None:
+        return ""
+
     try:
         document = Document(str(file_path))
     except Exception:
@@ -509,6 +530,9 @@ def read_docx(file_path: Path, max_chars: int) -> str:
 
 
 def read_pptx(file_path: Path, max_chars: int) -> str:
+    if Presentation is None:
+        return ""
+
     try:
         presentation = Presentation(str(file_path))
     except Exception:
@@ -533,6 +557,9 @@ def read_pptx(file_path: Path, max_chars: int) -> str:
 
 
 def read_xlsx(file_path: Path, max_chars: int) -> str:
+    if load_workbook is None:
+        return ""
+
     try:
         workbook = load_workbook(str(file_path), read_only=True, data_only=True)
     except Exception:
