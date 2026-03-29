@@ -1,8 +1,10 @@
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import unicodedata
 import urllib.error
@@ -35,8 +37,11 @@ OLLAMA_API_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:1.5b"
 DEFAULT_MIN_CONFIDENCE = 85
 DEFAULT_MAX_TEXT_CHARS = 6000
-CACHE_VERSION = "v6"
+DEFAULT_OLLAMA_TIMEOUT = 25
+CACHE_VERSION = "v7"
 CACHE_FILE = Path(__file__).with_name(".path_ai_cache.json")
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 def find_existing_folder(*names: str) -> Path:
@@ -774,6 +779,7 @@ def classify_with_ai(
     max_text_chars: int,
     cache: dict,
     ollama_url: str,
+    ollama_timeout: int,
     aggressive: bool = False,
 ) -> tuple[str | None, int, str]:
     subjects = list(SUBJECT_DESTINATIONS.keys()) + ["Por_Organizar"]
@@ -805,24 +811,24 @@ def classify_with_ai(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=ollama_timeout) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Erro HTTP do Ollama ({exc.code}): {error_body}") from exc
+        return "Por_Organizar", 0, f"erro HTTP do Ollama ({exc.code}): {error_body}"
     except urllib.error.URLError as exc:
-        raise RuntimeError(
-            "Erro ao contactar o Ollama. Verifique se a app/servidor Ollama está aberto."
-        ) from exc
+        return "Por_Organizar", 0, "erro ao contactar o Ollama"
+    except (TimeoutError, socket.timeout):
+        return "Por_Organizar", 0, "timeout do Ollama"
 
     raw_text = extract_response_text(response_data)
     if not raw_text:
-        raise RuntimeError(f"Resposta do Ollama sem texto útil para {file_path.name}.")
+        return "Por_Organizar", 0, "resposta do Ollama sem texto util"
 
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"JSON inválido devolvido pelo Ollama para {file_path.name}: {raw_text}") from exc
+        return "Por_Organizar", 0, "JSON invalido devolvido pelo Ollama"
 
     subject = parsed.get("subject", "Por_Organizar")
     confidence = int(parsed.get("confidence", 0))
@@ -850,6 +856,7 @@ def classify_directory_with_ai(
     max_text_chars: int,
     cache: dict,
     ollama_url: str,
+    ollama_timeout: int,
     aggressive: bool = False,
 ) -> tuple[str | None, int, str]:
     subjects = list(SUBJECT_DESTINATIONS.keys()) + ["Por_Organizar"]
@@ -880,24 +887,24 @@ def classify_directory_with_ai(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=ollama_timeout) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Erro HTTP do Ollama ({exc.code}): {error_body}") from exc
+        return "Por_Organizar", 0, f"erro HTTP do Ollama ({exc.code}): {error_body}"
     except urllib.error.URLError as exc:
-        raise RuntimeError(
-            "Erro ao contactar o Ollama. Verifique se a app/servidor Ollama está aberto."
-        ) from exc
+        return "Por_Organizar", 0, "erro ao contactar o Ollama"
+    except (TimeoutError, socket.timeout):
+        return "Por_Organizar", 0, "timeout do Ollama"
 
     raw_text = extract_response_text(response_data)
     if not raw_text:
-        raise RuntimeError(f"Resposta do Ollama sem texto útil para {dir_path.name}.")
+        return "Por_Organizar", 0, "resposta do Ollama sem texto util"
 
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"JSON inválido devolvido pelo Ollama para {dir_path.name}: {raw_text}") from exc
+        return "Por_Organizar", 0, "JSON invalido devolvido pelo Ollama"
 
     subject = parsed.get("subject", "Por_Organizar")
     confidence = int(parsed.get("confidence", 0))
@@ -926,6 +933,7 @@ def organize_downloads(
     max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
     limit: int | None = None,
     ollama_url: str = OLLAMA_API_URL,
+    ollama_timeout: int = DEFAULT_OLLAMA_TIMEOUT,
 ) -> None:
     if not dry_run:
         ensure_folder(BASE_FOLDER)
@@ -973,6 +981,7 @@ def organize_downloads(
                     max_text_chars=max_text_chars,
                     cache=cache,
                     ollama_url=ollama_url,
+                    ollama_timeout=ollama_timeout,
                     aggressive=ai_aggressive,
                 )
                 source = "ai"
@@ -993,6 +1002,7 @@ def organize_downloads(
                     max_text_chars=max_text_chars,
                     cache=cache,
                     ollama_url=ollama_url,
+                    ollama_timeout=ollama_timeout,
                     aggressive=ai_aggressive,
                 )
                 source = "ai"
@@ -1101,6 +1111,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("OLLAMA_API_URL", OLLAMA_API_URL),
         help=f"URL do endpoint chat do Ollama. Omissao: {OLLAMA_API_URL}.",
     )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=DEFAULT_OLLAMA_TIMEOUT,
+        help=f"Timeout em segundos para cada chamada ao Ollama. Omissao: {DEFAULT_OLLAMA_TIMEOUT}.",
+    )
     return parser.parse_args()
 
 
@@ -1117,4 +1133,5 @@ if __name__ == "__main__":
         max_text_chars=args.max_text_chars,
         limit=args.limit,
         ollama_url=args.ollama_url,
+        ollama_timeout=args.ollama_timeout,
     )

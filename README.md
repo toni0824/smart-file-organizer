@@ -89,6 +89,7 @@ python3 path.py --use-ai --model qwen2.5:1.5b
 - `--no-directories`: ignora pastas dentro de `Downloads`
 - `--limit N`: processa apenas os primeiros `N` itens
 - `--model`: escolhe o modelo local do Ollama
+- `--ollama-timeout`: limita quanto tempo cada pedido ao Ollama pode demorar
 - `--min-confidence`: confiança mínima para aceitar a decisão da IA
 - `--max-text-chars`: quantidade máxima de texto enviada ao modelo
 
