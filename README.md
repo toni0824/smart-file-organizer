@@ -18,6 +18,7 @@ O script combina:
 
 - organiza ficheiros da `Downloads`
 - processa também pastas dentro da `Downloads`
+- agrupa imagens soltas (`jpg`, `jpeg`, `png`) em `Downloads/Imagens`
 - lê conteúdo de `pdf`, `docx`, `pptx`, `xlsx`, `txt`, `py`, `html`, `csv` e `zip`
 - usa IA local para ficheiros ambíguos
 - tem um modo agressivo que usa IA em quase tudo

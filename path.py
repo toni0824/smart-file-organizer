@@ -50,6 +50,7 @@ def find_existing_folder(*names: str) -> Path:
 BASE_FOLDER = find_existing_folder("Downloads", "Transferencias", "Transferências")
 DEST_ROOT = Path.home() / "Documents" / "Tecnico"
 UNSORTED_FOLDER = DEST_ROOT / "Por_Organizar"
+IMAGES_FOLDER = BASE_FOLDER / "Imagens"
 
 # A ordem importa: regras mais especificas devem aparecer primeiro.
 SUBJECT_RULES = {
@@ -245,6 +246,12 @@ VALID_EXTENSIONS = {
     ".mat", ".dat", ".apk", ".iso",
 }
 
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+}
+
 AI_REVIEWABLE_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".txt", ".py", ".m", ".html", ".csv",
 }
@@ -260,6 +267,7 @@ SKIP_DIRECTORY_NAMES = {
     ".git",
     ".venv",
     "venv",
+    "Imagens",
 }
 
 ALWAYS_UNSORTED_KEYWORDS = [
@@ -923,8 +931,10 @@ def organize_downloads(
         ensure_folder(BASE_FOLDER)
         ensure_folder(DEST_ROOT)
         ensure_folder(UNSORTED_FOLDER)
+        ensure_folder(IMAGES_FOLDER)
 
     cache = load_cache() if use_ai else {}
+    image_count = 0
     moved_count = 0
     unsorted_count = 0
     kept_count = 0
@@ -946,6 +956,12 @@ def organize_downloads(
         if item.is_file():
             if item.suffix.lower() not in VALID_EXTENSIONS:
                 processed -= 1
+                continue
+
+            if item.suffix.lower() in IMAGE_EXTENSIONS:
+                final_path = safe_move(item, IMAGES_FOLDER, dry_run=dry_run)
+                print(f"[IMG] {item.name} -> {final_path.parent.name}")
+                image_count += 1
                 continue
 
             subject = classify_with_rules(item.name)
@@ -1022,6 +1038,7 @@ def organize_downloads(
         print(f"Modelo: {model}")
         print(f"Chamadas IA: {ai_count}")
         print(f"Cache: {CACHE_FILE}")
+    print(f"Imagens agrupadas: {image_count}")
     print(f"Movidos para cadeiras: {moved_count}")
     print(f"Movidos para Por_Organizar: {unsorted_count}")
     print(f"Deixados em Downloads: {kept_count}")
